@@ -102,6 +102,8 @@ Public fields exposed by `SensorswaveConfig` (other implementation details are h
 | `BatchSend` | bool | `false` | Enable batching + scheduled sending |
 | `EnableAB` | bool | `false` | Enable A/B testing & feature flags |
 | `AbRefreshInterval` | int (ms) | `600000` | AB config refresh interval (10 minutes) |
+| `OptOutCapturing` | bool | `false` | Compliance: disable capturing right at init. When `true`, the SDK does not construct/enqueue/report any event, sends no AB requests, and reads no user identity; call `OptInCapturing()` to enable after the user consents |
+| `PersistOptOut` | bool | `false` | Compliance: whether to persist the opt-out state locally so it survives across sessions. When `true`, the state toggled via `OptOutCapturing()` / `OptInCapturing()` is persisted and auto-restored on next launch (an explicit `OptOutCapturing=true` still forces disable and takes the highest priority) |
 
 ---
 
@@ -373,6 +375,55 @@ Sensorswave.GetExperiment("homepage_layout", exp =>
     if (exp.TryGetValue("variant", out var v))
         ApplyLayout(v);
 });
+```
+
+### Compliance & Capture Consent (Opt-out)
+
+The SDK provides a capture-consent (opt-out) mechanism to satisfy "capture only after user authorization" compliance requirements. While disabled, it follows a **no-write, no-read** principle: it does not construct/enqueue/report any event, does not send the AB `/ab/evalall` request, and does not read user identity (`anon_id` / `login_id`).
+
+- Events that occur while disabled are **dropped**.
+- Residual events already enqueued are not deleted; they are reported normally once capturing is re-enabled.
+- The initial state is controlled by the `OptOutCapturing` config (see [Configuration](#configuration)); switch it at runtime via the APIs below.
+
+#### OptOutCapturing
+
+```csharp
+public static void OptOutCapturing();
+```
+
+Disables capturing. You can already enter the disabled state at init via `OptOutCapturing=true`; call this method to disable again at runtime (e.g. when the user revokes consent). Silently ignored when not initialized.
+
+```csharp
+Sensorswave.OptOutCapturing();
+Debug.Log($"Capturing disabled: {Sensorswave.HasOptedOutCapturing()}");
+```
+
+#### OptInCapturing
+
+```csharp
+public static void OptInCapturing();
+```
+
+Enables capturing.
+
+```csharp
+// Enable capturing after the user accepts the privacy policy
+Sensorswave.OptInCapturing();
+```
+
+#### HasOptedOutCapturing
+
+```csharp
+public static bool HasOptedOutCapturing();
+```
+
+Queries whether capturing is currently disabled. Returns `true` when disabled; returns `false` when not initialized or already enabled.
+
+```csharp
+if (Sensorswave.HasOptedOutCapturing())
+{
+    // Not yet authorized; skip capture-dependent logic
+}
 ```
 
 ---

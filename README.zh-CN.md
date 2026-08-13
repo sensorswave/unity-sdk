@@ -102,6 +102,8 @@ public class GameInitializer : MonoBehaviour
 | `BatchSend` | bool | `false` | 是否启用攒批 + 定时上报 |
 | `EnableAB` | bool | `false` | 是否启用 A/B 测试与功能开关 |
 | `AbRefreshInterval` | int (ms) | `600000` | AB 配置刷新间隔（10 分钟） |
+| `OptOutCapturing` | bool | `false` | 合规：初始化即禁用采集。设为 `true` 后 SDK 不构造/入队/上报任何事件、不发 AB 请求、不读用户标识；用户授权后调用 `OptInCapturing()` 开启 |
+| `PersistOptOut` | bool | `false` | 合规：是否将 opt-out 状态持久化到本地、跨会话保留。设为 `true` 时经 `OptOutCapturing()` / `OptInCapturing()` 切换的状态会被持久化，下次启动自动恢复（`OptOutCapturing=true` 仍强制禁用，优先级最高） |
 
 ---
 
@@ -373,6 +375,55 @@ Sensorswave.GetExperiment("homepage_layout", exp =>
     if (exp.TryGetValue("variant", out var v))
         ApplyLayout(v);
 });
+```
+
+### 合规与采集授权（Opt-out）
+
+SDK 提供采集授权（opt-out）机制，用于满足「用户授权后再采集」的合规要求。禁用期间遵循**不写、不读**原则：不构造/不入队/上报任何事件、不发送 AB `/ab/evalall` 请求、不读取用户标识（`anon_id` / `login_id`）。
+
+- 禁用期间发生的事件会被**丢弃**。
+- 已入队的残留事件不会被删除，留待下次开启后正常上报。
+- 初始状态由配置 `OptOutCapturing` 决定（详见[配置项](#配置项)）；运行时通过下方 API 切换。
+
+#### OptOutCapturing
+
+```csharp
+public static void OptOutCapturing();
+```
+
+禁用采集。初始化时已可通过 `OptOutCapturing=true` 进入禁用态；如需运行时再次禁用（例如用户撤回授权）调用本方法。未初始化时调用会被静默忽略。
+
+```csharp
+Sensorswave.OptOutCapturing();
+Debug.Log($"已禁用采集: {Sensorswave.HasOptedOutCapturing()}");
+```
+
+#### OptInCapturing
+
+```csharp
+public static void OptInCapturing();
+```
+
+开启采集。
+
+```csharp
+// 用户同意隐私协议后开启采集
+Sensorswave.OptInCapturing();
+```
+
+#### HasOptedOutCapturing
+
+```csharp
+public static bool HasOptedOutCapturing();
+```
+
+查询当前是否已禁用采集。已禁用返回 `true`；未初始化或已开启返回 `false`。
+
+```csharp
+if (Sensorswave.HasOptedOutCapturing())
+{
+    // 尚未授权，跳过依赖采集的逻辑
+}
 ```
 
 ---
