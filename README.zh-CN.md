@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-[Sensors Wave](https://www.sensorswave.cn/) Unity 数据采集 SDK。面向 Unity 游戏与跨平台应用，提供埋点采集、用户识别、用户属性、公共属性、A/B 测试与功能开关、UTM 渠道归因、应用生命周期事件等能力，以 Unity `.unitypackage` 形式分发，不依赖任何特定游戏逻辑。
+[Sensors Wave](https://www.sensorswave.cn/) Unity 数据采集 SDK。面向 Unity 游戏与跨平台应用，提供埋点采集、用户识别、用户属性、公共属性、A/B 测试与功能开关、UTM 渠道归因、应用生命周期事件、异常与崩溃采集等能力，以 Unity `.unitypackage` 形式分发，不依赖任何特定游戏逻辑。
 
 如果你是第一次接触 Sensors Wave，欢迎前往 [sensorswave.cn](https://www.sensorswave.cn/) 了解产品并创建账号。
 
@@ -19,6 +19,7 @@
 - **A/B 测试与功能开关**：`CheckFeatureGate` / `GetFeatureConfig` / `GetExperiment`，异步回调，缓存优先（fastFetch）策略
 - **UTM 渠道归因**：自动解析启动参数中的 UTM 字段
 - **生命周期事件**：自动采集 `$AppInstall` / `$AppStart` / `$AppEnd`
+- **异常与崩溃采集**：自动捕获未捕获托管异常（error）与进程致命崩溃（fatal，下次启动补偿上报）为 `$Exception` 事件；已捕获的异常可用 `TrackException` 手动上报
 - **预置属性**：自动附加设备、系统、网络、应用、SDK 版本等环境信息
 - **离线可靠上报**：本地持久化队列、批量发送、失败自动重试、指数退避
 
@@ -102,6 +103,8 @@ public class GameInitializer : MonoBehaviour
 | `BatchSend` | bool | `false` | 是否启用攒批 + 定时上报 |
 | `EnableAB` | bool | `false` | 是否启用 A/B 测试与功能开关 |
 | `AbRefreshInterval` | int (ms) | `600000` | AB 配置刷新间隔（10 分钟） |
+| `EnableErrorTrack` | bool | `false` | 异常采集：自动捕获未捕获的托管异常，上报 `$Exception`（`$exception_level = "error"`）。全平台生效，独立于 `AutoCapture` |
+| `EnableCrashTrack` | bool | `false` | 崩溃采集：检测未捕获异常导致的进程终止，上报 `$Exception`（`$exception_level = "fatal"`）。仅 App 环境生效（iOS / Android / HarmonyOS / PC / Editor）；WebGL / 小游戏无进程概念 |
 | `OptOutCapturing` | bool | `false` | 合规：初始化即禁用采集。设为 `true` 后 SDK 不构造/入队/上报任何事件、不发 AB 请求、不读用户标识；用户授权后调用 `OptInCapturing()` 开启 |
 | `PersistOptOut` | bool | `false` | 合规：是否将 opt-out 状态持久化到本地、跨会话保留。设为 `true` 时经 `OptOutCapturing()` / `OptInCapturing()` 切换的状态会被持久化，下次启动自动恢复（`OptOutCapturing=true` 仍强制禁用，优先级最高） |
 
@@ -201,6 +204,47 @@ var evt = new EventData("purchase")
 Sensorswave.Track(evt);
 ```
 
+### 异常采集（$Exception）
+
+SDK 可自动捕获托管异常与崩溃并上报为 `$Exception` 事件，同时提供手动 API 上报已捕获的异常。
+
+`SensorswaveConfig` 中两个独立开关（均默认 `false`，独立于 `AutoCapture`）：
+
+| 开关 | 级别 | 生效范围 | 采集内容 |
+|------|------|------|------|
+| `EnableErrorTrack` | `$exception_level = "error"` | 全部宿主（App / PC / Editor / WebGL / 小游戏） | 未捕获托管异常（Unity `LogType.Exception`：被引擎兜底记录但进程未终止） |
+| `EnableCrashTrack` | `$exception_level = "fatal"` | 仅 App 宿主（iOS / Android / HarmonyOS / PC / Editor） | 未捕获异常导致进程终止（app crash） |
+
+每条 `$Exception` 事件携带 `$exception_level`、`$exception_type`、`$exception_message`、`$exception_frames`（结构化堆栈帧，最多 30 帧；无法解析出帧时省略）。
+
+fatal 检测机制：捕获到异常时 SDK 写入崩溃标记文件（`sw_crash_marker.json`）；进程活过宽限窗口（10 秒）则删除标记（仅按 error 上报）；进程在窗口内死亡，则下次启动补报 `fatal` 级 `$Exception`，事件 `time` 与用户归属还原为崩溃时刻。正常退出与进入后台都会删除标记，后台被系统回收不会被误报为 crash。
+
+防异常风暴机制内建（无需配置）：同指纹 1 秒防抖、单会话同指纹最多上报 10 条、单会话 128 个不同指纹熔断。
+
+已知边界：纯 C# 层捕获，不覆盖原生崩溃（SIGSEGV、OC/Java 未捕获异常）；两开关都开且异常致命时，会各报一条 `error` 与 `fatal`（两个独立事实）。
+
+#### TrackException
+
+```csharp
+public static void TrackException(Exception exception, Dictionary<string, object> properties = null);
+```
+
+手动上报一个已捕获的异常（`$Exception` 事件，`$exception_level` 固定为 `"error"`）。适用于游戏自身 catch 了异常但仍希望上报的场景。不受 `EnableErrorTrack` / `EnableCrashTrack` 开关限制；仍受初始化与 opt-out 合规守卫约束（禁用期调用为 no-op）。`exception` 为 null 时记录日志并忽略。`properties` 中同名 `$exception_*` 键以 SDK 生成的值为准。
+
+```csharp
+try
+{
+    EnterLevel();
+}
+catch (Exception e)
+{
+    Sensorswave.TrackException(e, new Dictionary<string, object>
+    {
+        { "level_id", 42 },
+    });
+}
+```
+
 ### 用户身份
 
 #### Identify
@@ -232,6 +276,22 @@ public static string GetLoginId(); // 当前登录 ID，未设置返回空字符
 
 ```csharp
 Debug.Log($"AnonId={Sensorswave.GetAnonId()}, LoginId={Sensorswave.GetLoginId()}");
+```
+
+#### Reset
+
+```csharp
+public static void Reset(bool resetAnonId = false);
+```
+
+用户登出时调用，解除登录 ID 与设备的绑定。默认保留匿名 ID，登出后事件继续以匿名 ID 作为 distinct_id 上报；传 `true` 时同时重置（重新生成）匿名 ID，如公共设备场景。已入队/已上报的历史事件不受影响。
+
+```csharp
+// 用户登出时
+Sensorswave.Reset();  // 默认保留匿名 ID
+
+// 如果需要同时重置匿名 ID（如公共设备场景）
+Sensorswave.Reset(true);
 ```
 
 ### 用户属性
@@ -430,13 +490,14 @@ if (Sensorswave.HasOptedOutCapturing())
 
 ## 预置事件
 
-启用 `AutoCapture = true` 后自动触发：
+生命周期事件在启用 `AutoCapture = true` 后自动触发；`$Exception` 由独立开关控制（见[异常采集](#异常采集exception)）：
 
 | 事件 | 触发时机 |
 |------|----------|
 | `$AppInstall` | 首次启动应用（基于本地标记） |
 | `$AppStart` | 应用进入前台 |
 | `$AppEnd` | 应用进入后台，并附带 `$event_duration` |
+| `$Exception` | 未捕获托管异常（`error`，`EnableErrorTrack`）或进程致命崩溃（`fatal`，`EnableCrashTrack`） |
 
 自定义事件请使用 `TrackEvent` / `Track`。
 
@@ -457,7 +518,7 @@ if (Sensorswave.HasOptedOutCapturing())
 
 ## 编辑器集成
 
-SDK 提供一个 `SensorswaveSettings` ScriptableObject（`Create → Sensorswave → Sensorswave Settings`），可在 Inspector 中以可视化方式配置 token、host、批量参数、生命周期、A/B、UTM 等，并通过 `ToRuntimeConfig()` 生成运行时 `SensorswaveConfig`。`Editor/SensorswaveSettingsInspector.cs` 提供自定义 Inspector 与校验。
+SDK 提供一个 `SensorswaveSettings` ScriptableObject（`Create → Sensorswave → Sensorswave Settings`），可在 Inspector 中以可视化方式配置 token、host、批量参数、生命周期、A/B、UTM、异常/崩溃采集等，并通过 `ToRuntimeConfig()` 生成运行时 `SensorswaveConfig`。`Editor/SensorswaveSettingsInspector.cs` 提供自定义 Inspector 与校验。
 
 ```csharp
 var settings = SensorswaveSettings.CreateInstance<SensorswaveSettings>();

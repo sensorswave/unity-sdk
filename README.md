@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A Unity data-collection SDK for [Sensors Wave](https://www.sensorswave.cn/). Built for Unity games and cross-platform apps, it provides event tracking, user identification, user properties, common properties, A/B testing & feature flags, UTM attribution, and app lifecycle events. Distributed as a Unity `.unitypackage`, it is independent of any specific game logic.
+A Unity data-collection SDK for [Sensors Wave](https://www.sensorswave.cn/). Built for Unity games and cross-platform apps, it provides event tracking, user identification, user properties, common properties, A/B testing & feature flags, UTM attribution, app lifecycle events, and exception & crash tracking. Distributed as a Unity `.unitypackage`, it is independent of any specific game logic.
 
 If you are new to Sensors Wave, visit [sensorswave.cn](https://www.sensorswave.cn/) to learn about the product and create an account.
 
@@ -19,6 +19,7 @@ If you are new to Sensors Wave, visit [sensorswave.cn](https://www.sensorswave.c
 - **A/B testing & feature flags**: `CheckFeatureGate` / `GetFeatureConfig` / `GetExperiment`, async callbacks, cache-first (fastFetch) strategy
 - **UTM attribution**: automatically parses UTM fields from launch parameters
 - **Lifecycle events**: auto-captures `$AppInstall` / `$AppStart` / `$AppEnd`
+- **Exception & crash tracking**: auto-captures uncaught managed exceptions (`error`) and process-fatal crashes (`fatal`, compensated on next launch) as `$Exception` events; `TrackException` for exceptions you have already caught
 - **Preset properties**: automatically attaches environment info such as device, OS, network, app, and SDK version
 - **Offline reliable reporting**: local persistent queue, batch sending, automatic retry on failure with exponential backoff
 
@@ -102,6 +103,8 @@ Public fields exposed by `SensorswaveConfig` (other implementation details are h
 | `BatchSend` | bool | `false` | Enable batching + scheduled sending |
 | `EnableAB` | bool | `false` | Enable A/B testing & feature flags |
 | `AbRefreshInterval` | int (ms) | `600000` | AB config refresh interval (10 minutes) |
+| `EnableErrorTrack` | bool | `false` | Exception tracking: auto-captures uncaught managed exceptions and reports `$Exception` (`$exception_level = "error"`). Effective on all hosts, independent of `AutoCapture` |
+| `EnableCrashTrack` | bool | `false` | Crash tracking: detects process-fatal uncaught exceptions and reports `$Exception` (`$exception_level = "fatal"`). App hosts only (iOS / Android / HarmonyOS / PC / Editor); WebGL / mini games have no process concept |
 | `OptOutCapturing` | bool | `false` | Compliance: disable capturing right at init. When `true`, the SDK does not construct/enqueue/report any event, sends no AB requests, and reads no user identity; call `OptInCapturing()` to enable after the user consents |
 | `PersistOptOut` | bool | `false` | Compliance: whether to persist the opt-out state locally so it survives across sessions. When `true`, the state toggled via `OptOutCapturing()` / `OptInCapturing()` is persisted and auto-restored on next launch (an explicit `OptOutCapturing=true` still forces disable and takes the highest priority) |
 
@@ -201,6 +204,47 @@ var evt = new EventData("purchase")
 Sensorswave.Track(evt);
 ```
 
+### Exception Tracking ($Exception)
+
+The SDK can automatically capture managed exceptions and crashes and report them as `$Exception` events, and offers a manual API for exceptions you have already caught.
+
+Two independent switches in `SensorswaveConfig` (both default `false`, independent of `AutoCapture`):
+
+| Switch | Level | Scope | What is captured |
+|------|------|------|------|
+| `EnableErrorTrack` | `$exception_level = "error"` | All hosts (App / PC / Editor / WebGL / mini games) | Uncaught managed exceptions (Unity `LogType.Exception`: logged by the engine while the process keeps running) |
+| `EnableCrashTrack` | `$exception_level = "fatal"` | App hosts only (iOS / Android / HarmonyOS / PC / Editor) | An uncaught exception that terminates the process (app crash) |
+
+Each `$Exception` event carries `$exception_level`, `$exception_type`, `$exception_message`, and `$exception_frames` (structured stack frames, up to 30 frames; omitted when no frame can be parsed).
+
+How fatal detection works: when an exception is captured, the SDK writes a crash marker file (`sw_crash_marker.json`). If the process survives the grace window (10 s), the marker is deleted (reported as error only). If the process dies within the window, the next launch compensates with a `fatal` `$Exception` whose `time` and user attribution are restored to the crash moment. Clean exit and backgrounding both delete the marker, so background eviction by the OS is not misreported as a crash.
+
+Anti-storm mechanisms are built in (no configuration needed): same-fingerprint debounce within 1 s, at most 10 reports per fingerprint per session, and a circuit breaker that caps the session at 128 distinct fingerprints.
+
+Known limits: capture happens in the pure C# layer — native crashes (SIGSEGV, uncaught OC/Java exceptions) are not covered. If both switches are on and an exception turns out to be fatal, one `error` and one `fatal` event are reported (two independent facts).
+
+#### TrackException
+
+```csharp
+public static void TrackException(Exception exception, Dictionary<string, object> properties = null);
+```
+
+Manually reports an exception you have already caught (a `$Exception` event with `$exception_level` fixed to `"error"`). Suitable when your own code catches an exception but you still want it reported. Not gated by `EnableErrorTrack` / `EnableCrashTrack`; still subject to initialization and opt-out guards (no-op while capturing is disabled). A `null` `exception` is logged and ignored. Same-named `$exception_*` keys in `properties` are overridden by the SDK-generated values.
+
+```csharp
+try
+{
+    EnterLevel();
+}
+catch (Exception e)
+{
+    Sensorswave.TrackException(e, new Dictionary<string, object>
+    {
+        { "level_id", 42 },
+    });
+}
+```
+
 ### User Identity
 
 #### Identify
@@ -232,6 +276,22 @@ public static string GetLoginId(); // current login ID; returns empty string if 
 
 ```csharp
 Debug.Log($"AnonId={Sensorswave.GetAnonId()}, LoginId={Sensorswave.GetLoginId()}");
+```
+
+#### Reset
+
+```csharp
+public static void Reset(bool resetAnonId = false);
+```
+
+Signs the user out by unbinding the login ID from the device. By default the anonymous ID is kept, so subsequent events continue to be reported under the same anonymous ID. Pass `true` to also reset (regenerate) the anonymous ID, e.g. for shared/public devices. Events already queued or reported are not affected.
+
+```csharp
+// Called when the user logs out
+Sensorswave.Reset();  // keeps the anonymous ID (default)
+
+// Also reset the anonymous ID (e.g., shared device)
+Sensorswave.Reset(true);
 ```
 
 ### User Properties
@@ -430,13 +490,14 @@ if (Sensorswave.HasOptedOutCapturing())
 
 ## Preset Events
 
-Auto-triggered when `AutoCapture = true`:
+Lifecycle events are auto-triggered when `AutoCapture = true`; `$Exception` is controlled by its own switches (see [Exception Tracking](#exception-tracking-exception)):
 
 | Event | Trigger |
 |------|----------|
 | `$AppInstall` | First app launch (based on a local flag) |
 | `$AppStart` | App enters the foreground |
 | `$AppEnd` | App enters the background, with `$event_duration` attached |
+| `$Exception` | Uncaught managed exception (`error`, `EnableErrorTrack`) or process-fatal crash (`fatal`, `EnableCrashTrack`) |
 
 For custom events, use `TrackEvent` / `Track`.
 
@@ -457,7 +518,7 @@ When `EnablePresetProperties = true` (on by default), `PresetPropertiesPlugin` a
 
 ## Editor Integration
 
-The SDK provides a `SensorswaveSettings` ScriptableObject (`Create → Sensorswave → Sensorswave Settings`) that lets you visually configure token, host, batching, lifecycle, A/B, UTM, etc. in the Inspector, and generate a runtime `SensorswaveConfig` via `ToRuntimeConfig()`. `Editor/SensorswaveSettingsInspector.cs` provides a custom Inspector with validation.
+The SDK provides a `SensorswaveSettings` ScriptableObject (`Create → Sensorswave → Sensorswave Settings`) that lets you visually configure token, host, batching, lifecycle, A/B, UTM, exception/crash tracking, etc. in the Inspector, and generate a runtime `SensorswaveConfig` via `ToRuntimeConfig()`. `Editor/SensorswaveSettingsInspector.cs` provides a custom Inspector with validation.
 
 ```csharp
 var settings = SensorswaveSettings.CreateInstance<SensorswaveSettings>();
